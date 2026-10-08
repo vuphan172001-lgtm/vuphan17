@@ -1,0 +1,410 @@
+import os
+import time
+import asyncio
+import requests
+from datetime import datetime
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters,
+)
+
+# ==========================================
+# 🔑 CẤU HÌNH BOT TELEGRAM (ĐÃ GẮN TOKEN)
+# ==========================================
+BOT_TOKEN = "8732264001:AAFkX6ZApaUeAl7YCRsbyAyCVOt9WPAMGXo"
+ACC_FILE = "accounts.txt"
+
+# Các trạng thái ConversationHandler
+WAIT_ACC_INPUT, WAIT_DEL_INDEX, WAIT_CODE_INPUT, WAIT_THRES_INPUT = range(4)
+
+# Biến toàn cục theo dõi dữ liệu
+total_harvested = defaultdict(float)
+wallet_balances = {'build': 0.0, 'world': 0.0, 'usdt': 0.0}
+history_records = []
+
+# ==========================================
+# 📁 QUẢN LÝ TÀI KHOẢN (READ/WRITE FILE)
+# ==========================================
+def load_accounts():
+    if not os.path.exists(ACC_FILE):
+        with open(ACC_FILE, 'w', encoding='utf-8') as f:
+            pass
+    accounts = []
+    with open(ACC_FILE, 'r', encoding='utf-8') as f:
+        for line in f:
+            if '|' in line:
+                parts = line.strip().split('|')
+                if len(parts) >= 3:
+                    accounts.append({'id': parts[0], 'key': parts[1], 'name': parts[2]})
+    return accounts
+
+def save_accounts(accounts):
+    with open(ACC_FILE, 'w', encoding='utf-8') as f:
+        for acc in accounts:
+            f.write(f"{acc['id']}|{acc['key']}|{acc['name']}\n")
+
+def get_user_info(u_id, u_key):
+    try:
+        url = f"https://user.3games.io/user/regist?is_cwallet=1&is_mission_setting=true&time={int(time.time()*1000)}"
+        headers = {'User-Id': str(u_id), 'User-Secret-Key': str(u_key)}
+        r = requests.get(url, headers=headers, timeout=5)
+        js = r.json()
+        if js.get('code') == 200:
+            return js['data']['username']
+    except Exception:
+        pass
+    return 'Unknown'
+
+def update_all_wallets(accounts):
+    temp_balances = {'build': 0.0, 'world': 0.0, 'usdt': 0.0}
+    def fetch_wallet(acc):
+        try:
+            url = 'https://wallet.3games.io/api/wallet/user_asset'
+            headers = {
+                'User-Id': str(acc['id']),
+                'User-Secret-Key': str(acc['key']),
+                'Content-Type': 'application/json'
+            }
+            payload = {'user_id': int(acc['id']), 'source': 'home'}
+            r = requests.post(url, headers=headers, json=payload, timeout=5)
+            js = r.json()
+            if js.get('code') == 0:
+                assets = js.get('data', {}).get('user_asset', {})
+                return {
+                    'build': float(assets.get('BUILD', 0)),
+                    'world': float(assets.get('WORLD', 0)),
+                    'usdt': float(assets.get('USDT', 0))
+                }
+        except Exception:
+            pass
+        return {'build': 0.0, 'world': 0.0, 'usdt': 0.0}
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = executor.map(fetch_wallet, accounts)
+        for res in results:
+            temp_balances['build'] += res['build']
+            temp_balances['world'] += res['world']
+            temp_balances['usdt'] += res['usdt']
+    wallet_balances.update(temp_balances)
+
+# ==========================================
+# 🌐 GIAO TIẾP API REDCODE 3GAMES
+# ==========================================
+def check_code(acc, code):
+    try:
+        headers = {
+            'User-Id': str(acc['id']),
+            'User-Secret-Key': str(acc['key']),
+            'Content-Type': 'application/json'
+        }
+        url = 'https://web3task.3games.io/v1/task/redcode/detail'
+        r = requests.post(url, headers=headers, json={'code': code}, timeout=5)
+        return r.json()
+    except Exception:
+        return {'code': -1}
+
+def exchange_code(acc, code):
+    try:
+        headers = {
+            'User-Id': str(acc['id']),
+            'User-Secret-Key': str(acc['key']),
+            'Content-Type': 'application/json'
+        }
+        payload = {'code': code, 'os_ver': 'pc', 'platform': 'h5', 'appname': 'app'}
+        url = 'https://web3task.3games.io/v1/task/redcode/exchange'
+        r = requests.post(url, headers=headers, json=payload, timeout=5)
+        return r.json()
+    except Exception:
+        return {}
+
+# ==========================================
+# 📱 GIAO DIỆN NÚT BẤM TELEGRAM
+# ==========================================
+def get_main_keyboard():
+    keyboard = [
+        [KeyboardButton("Bắt đầu"), KeyboardButton("📊 Dashboard")],
+        [KeyboardButton("➕ Thêm Acc"), KeyboardButton("➖ Xóa Acc"), KeyboardButton("📋 Danh sách Acc")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_text = (
+        "🤖 **HỆ THỐNG AUTO REDCODE 3GAMES BOT**\n\n"
+        "Vui lòng chọn nút chức năng bên dưới bàn phím để thao tác:\n"
+        "• *Bắt đầu*: Tiến hành chạy nhập code / canh lượt trống.\n"
+        "•*📊 Dashboard**: Xem tổng số dư tài sản và lịch sử.\n"
+        "•*📋 Danh sách Acc**: Kiểm tra các tài khoản hiện có."
+    )
+    await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+
+async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    accounts = load_accounts()
+    if accounts:
+        update_all_wallets(accounts)
+    
+    text = "📊 **DASHBOARD BÁO CÁO TÀI SẢN**\n\n"
+    text += "💰 **Tổng Số Dư Hiện Tại:**\n"
+    text += f"• BUILD: {wallet_balances['build']:,.2f} | 🌾 +`{total_harvested['build']:,.2f}`\n"
+    text += f"• WORLD: {wallet_balances['world']:,.4f} | 🌾 +`{total_harvested['world']:,.4f}`\n"
+    text += f"• USDT: {wallet_balances['usdt']:,.6f} | 🌾 +`{total_harvested['usdt']:,.6f}`\n\n"
+    
+    text += "📜 **Lịch Sử Nhập Code Gần Đây:**\n"
+    if not history_records:
+        text += "_Chưa có dữ liệu lịch sử._\n"
+    else:
+        for rec in history_records[-8:]:
+            text += f"• [{rec[0]}] {rec[1]}: *{rec[2]} {rec[3]}*\n"
+            
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    accounts = load_accounts()
+    if not accounts:
+        await update.message.reply_text("❌ Chưa có tài khoản nào trong hệ thống!")
+        return
+        
+    text = f"📋 **DANH SÁCH TÀI KHOẢN ({len(accounts)}/10)**\n\n"
+    for i, acc in enumerate(accounts, 1):
+        text += f"*{i}.* {acc['id']} - **{acc['name']}**\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+# ==========================================
+# ➕/➖ THÊM & XÓA TÀI KHOẢN
+# ==========================================
+async def add_acc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    accounts = load_accounts()
+    if len(accounts) >= 10:
+        await update.message.reply_text("❌ Đã đạt giới hạn tối đa 10 tài khoản!")
+        return ConversationHandler.END
+        
+    await update.message.reply_text("📝 Gửi URL dạng userId=...&secretKey=... hoặc định dạng ID|Key vào khung chat:")
+    return WAIT_ACC_INPUT
+
+async def add_acc_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    inp = update.message.text.strip()
+    u_id, u_key = None, None
+    
+    if 'http' in inp or 'userId' in inp:
+        try:
+            from urllib.parse import urlparse, parse_qs
+            params = parse_qs(urlparse(inp).query)
+            u_id = params.get('userId', [None])[0]
+            u_key = params.get('secretKey', [None])[0]
+        except Exception:
+            pass
+    elif '|' in inp:
+        parts = inp.split('|')
+        if len(parts) >= 2:
+            u_id, u_key = parts[0].strip(), parts[1].strip()
+            
+    if u_id and u_key:
+        name = get_user_info(u_id, u_key)
+        accounts = load_accounts()
+        accounts.append({'id': u_id, 'key': u_key, 'name': name})
+        save_accounts(accounts)
+        await update.message.reply_text(f"✅ Đã thêm tài khoản: *{name}*", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Định dạng không hợp lệ, thao tác đã bị hủy.")
+        
+    return ConversationHandler.END
+
+async def del_acc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    accounts = load_accounts()
+    if not accounts:
+        await update.message.reply_text("❌ Không có tài khoản nào để xóa!")
+        return ConversationHandler.END
+        
+    text = "🔢 **Nhập STT tài khoản muốn xóa:**\n\n"
+    for i, acc in enumerate(accounts, 1):
+        text += f"*{i}.* {acc['name']} ({acc['id']})\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+    return WAIT_DEL_INDEX
+
+async def del_acc_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        idx = int(update.message.text.strip()) - 1
+        accounts = load_accounts()
+        if 0 <= idx < len(accounts):
+            removed = accounts.pop(idx)
+            save_accounts(accounts)
+            await update.message.reply_text(f"🗑️ Đã xóa tài khoản: *{removed['name']}*", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ STT không hợp lệ!")
+    except Exception:
+        await update.message.reply_text("❌ Vui lòng nhập số nguyên hợp lệ!")
+    return ConversationHandler.END
+
+# ==========================================
+# ⚡ TIẾN TRÌNH NHẬP CODE & CANH TURBO
+# ==========================================
+async def start_bot_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    accounts = load_accounts()
+    if not accounts:
+        await update.message.reply_text("❌ Vui lòng bấm *➕ Thêm Acc* để thêm ít nhất 1 tài khoản trước!")
+        return ConversationHandler.END
+        
+    await update.message.reply_text("🎯 *Nhập mã Redcode cần chạy vào khung chat:*", parse_mode="Markdown")
+    return WAIT_CODE_INPUT
+
+async def process_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.strip()
+    accounts = load_accounts()
+    
+    msg = await update.message.reply_text("🔄 Đang kiểm tra mã code...")
+    res = check_code(accounts[0], code)
+    
+    if res.get('code') != 0:
+        await msg.edit_text(f"❌ *Code lỗi hoặc không tồn tại:* {res.get('msg', 'Unknown')}", parse_mode="Markdown")
+        return ConversationHandler.END
+        
+    data = res['data']
+    context.user_data['code'] = code
+    context.user_data['code_data'] = data
+    
+    val = float(data.get('value', 0))
+    f_val = f"{val:,.0f}".replace(',', '.')
+    created_ts = datetime.fromtimestamp(data.get('created_ts', 0)).strftime('%H:%M:%S %d/%m')
+    expired_ts = datetime.fromtimestamp(data.get('expired_ts', 0)).strftime('%H:%M:%S %d/%m')
+    remain = int(data.get('user_cnt', 0)) - int(data.get('progress', 0))
+    
+    info_text = (
+        f"🎁 **THÔNG TIN CODE: {data.get('title', 'Unknown').upper()}**\n\n"
+        f"• *Người tạo:* {data.get('nickname', 'Unknown')}\n"
+        f"• *Phần thưởng:* {f_val} {data.get('currency', '').upper()}\n"
+        f"• *Đã nhập:* `{data.get('progress', 0)} / {data.get('user_cnt', 0)}`\n"
+        f"• *Lượt còn lại:* `{remain}`\n"
+        f"• *Thời gian tạo:* {created_ts}\n"
+        f"• *Hết hạn:* {expired_ts}\n\n"
+        "👉 **Nhập ngưỡng lượt trống để canh (ví dụ: gõ 5 để tự chạy khi lượt còn lại <= 5). Nếu muốn chạy ngay lập tức, gõ 0:**"
+    )
+    await msg.edit_text(info_text, parse_mode="Markdown")
+    return WAIT_THRES_INPUT
+
+async def execute_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        thres = int(update.message.text.strip())
+    except Exception:
+        thres = 0
+        
+    code = context.user_data.get('code')
+    accounts = load_accounts()
+    
+    status_msg = await update.message.reply_text(f"⏳ **Khởi tạo tiến trình canh code {code}...**", parse_mode="Markdown")
+    
+    # Canh lượt trống nếu thres > 0
+    if thres > 0:
+        last_rem = None
+        while True:
+            c_res = check_code(accounts[0], code)
+            if c_res.get('code') != 0:
+                await status_msg.edit_text("❌ Code không còn khả dụng hoặc đã hết lượt!")
+                return ConversationHandler.END
+                
+            inf = c_res['data']
+            rem = int(inf['user_cnt']) - int(inf['progress'])
+            
+            if rem != last_rem:
+                await status_msg.edit_text(f"🕵️ **Đang canh code...**\n• Còn lại: {rem} lượt\n• Ngưỡng kích hoạt: {thres}", parse_mode="Markdown")
+                last_rem = rem
+            
+            if rem <= thres:
+                await update.message.reply_text(f"⚡ *ĐẠT NGƯỠNG {thres}! KÍCH HOẠT TURBO CHẠY CODE...*")
+                break
+            await asyncio.sleep(1)
+
+    # Chạy nhập code đa luồng cho các tài khoản
+    await status_msg.edit_text(f"🚀 *Đang chạy {len(accounts)} tài khoản...*", parse_mode="Markdown")
+    
+    succeeded_indices = set()
+    max_rounds = 20
+    results_log = []
+
+    def process_acc(idx, acc):
+        if idx in succeeded_indices:
+            return
+        try:
+            res = exchange_code(acc, code)
+            code_res = res.get('code')
+            if code_res == 0:
+                v = float(res['data']['value'])
+                cur = res['data']['currency'].lower()
+                total_harvested[cur] += v
+                now_str = datetime.now().strftime('%H:%M:%S')
+                history_records.append([now_str, f"{acc['name']}", f"+{v:,.2f}", cur.upper()])
+                results_log.append(f"✅ {acc['name']}: +{v} {cur.upper()}")
+                succeeded_indices.add(idx)
+            elif code_res == 100306:
+                results_log.append(f"⚠️ {acc['name']}: Đã nhập trước đó")
+                succeeded_indices.add(idx)
+            else:
+                results_log.append(f"❌ {acc['name']}: Lỗi {code_res}")
+        except Exception:
+            results_log.append(f"❌ {acc['name']}: Lỗi kết nối")
+
+    for round_num in range(1, max_rounds + 1):
+        if len(succeeded_indices) == len(accounts):
+            break
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(process_acc, idx, acc) for idx, acc in enumerate(accounts)]
+            for f in futures:
+                f.result()
+
+    summary_text = "🎉 **KẾT QUẢ NHẬP CODE:**\n\n" + "\n".join(results_log[-15:])
+    await update.message.reply_text(summary_text, parse_mode="Markdown")
+    
+    # Đồng bộ lại số dư tài sản
+    update_all_wallets(accounts)
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Đã hủy thao tác.", reply_markup=get_main_keyboard())
+    return ConversationHandler.END
+
+# ==========================================
+# 🚀 KHỞI CHẠY BOT
+# ==========================================
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    add_acc_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^➕ Thêm Acc$"), add_acc_start)],
+        states={WAIT_ACC_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_acc_process)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    del_acc_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^➖ Xóa Acc$"), del_acc_start)],
+        states={WAIT_DEL_INDEX: [MessageHandler(filters.TEXT & ~filters.COMMAND, del_acc_process)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    run_code_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^Bắt đầu$"), start_bot_process)],
+        states={
+            WAIT_CODE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_code_input)],
+            WAIT_THRES_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, execute_run)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.Regex("^📊 Dashboard$"), show_dashboard))
+    app.add_handler(MessageHandler(filters.Regex("^📋 Danh sách Acc$"), list_accounts))
+    
+    app.add_handler(add_acc_handler)
+    app.add_handler(del_acc_handler)
+    app.add_handler(run_code_handler)
+
+    print("Bot Telegram đang chạy...")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
